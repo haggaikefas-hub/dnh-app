@@ -350,7 +350,7 @@ input,select,textarea{font-family:'Georgia',serif}
 // PASTE YOUR FIREBASE CONFIG HERE
 // (replace every REPLACE_WITH_... value)
 // ══════════════════════════════════════════
-const firebaseConfig = {
+const FIREBASE_CONFIG = {
   apiKey: "AIzaSyDsLSWBZh-vdOArao-7pFv6llgFbA3TZJc",
   authDomain: "dnh-laundromat.firebaseapp.com",
   projectId: "dnh-laundromat",
@@ -358,6 +358,7 @@ const firebaseConfig = {
   messagingSenderId: "822234406813",
   appId: "1:822234406813:web:600b46be92cd0ae8a7d974"
 };
+
 // ══ STATE ══
 let db=null,isOnline=false,invoices=[],settings={},priceList=[],staffList=[],cart=[],statusFilter='all',adminUnlocked=false,currentStaffName='';
 
@@ -456,25 +457,35 @@ function initFirebase(){
     firebase.initializeApp(FIREBASE_CONFIG);
     db=firebase.firestore();
     db.enablePersistence({synchronizeTabs:true}).catch(()=>{});
+    // Mark online as soon as Firestore responds — even if collection is empty
     db.collection('invoices').orderBy('createdAt','desc').onSnapshot(snap=>{
-      const list=[];
-      snap.forEach(doc=>list.push({id:doc.id,...doc.data()}));
-      if(list.length>0){ invoices=list; saveLocalData(); refreshInvoiceViews(); }
       setOnline(true);
-    },()=>setOnline(false));
-    db.collection('config').doc('settings').onSnapshot(snap=>{ if(snap.exists){ settings={...DEFAULT_SETTINGS,...snap.data()}; saveLocalData(); applySettings(); } });
-    db.collection('config').doc('prices').onSnapshot(snap=>{ if(snap.exists&&snap.data().list){ priceList=snap.data().list; saveLocalData(); renderItemList(); } });
-    db.collection('config').doc('staff').onSnapshot(snap=>{ if(snap.exists&&snap.data().list){ staffList=snap.data().list; saveLocalData(); if(adminUnlocked)renderStaffEditor(); } });
+      const list=[];
+      snap.forEach(doc=>{
+        const d=doc.data();
+        // Convert Firestore Timestamp to ISO string for createdAt
+        if(d.createdAt&&d.createdAt.toDate) d.createdAt=d.createdAt.toDate().toISOString();
+        if(d.updatedAt&&d.updatedAt.toDate) d.updatedAt=d.updatedAt.toDate().toISOString();
+        list.push({id:doc.id,...d});
+      });
+      invoices=list; saveLocalData(); refreshInvoiceViews();
+      syncPending();
+    },err=>{ console.warn('Firestore error:',err); setOnline(false); });
+    db.collection('config').doc('settings').onSnapshot(snap=>{ if(snap.exists){ settings={...DEFAULT_SETTINGS,...snap.data()}; saveLocalData(); applySettings(); } },()=>{});
+    db.collection('config').doc('prices').onSnapshot(snap=>{ if(snap.exists&&snap.data().list){ priceList=snap.data().list; saveLocalData(); renderItemList(); } },()=>{});
+    db.collection('config').doc('staff').onSnapshot(snap=>{ if(snap.exists&&snap.data().list){ staffList=snap.data().list; saveLocalData(); if(adminUnlocked)renderStaffEditor(); } },()=>{});
     window.addEventListener('online',()=>{ setOnline(true); syncPending(); });
     window.addEventListener('offline',()=>setOnline(false));
+    // Set initial badge based on navigator, will correct itself when Firestore responds
     setOnline(navigator.onLine);
-  }catch(e){ setOnline(false); }
+  }catch(e){ console.error('Firebase init error:',e); setOnline(false); }
 }
 function setOnline(v){
   isOnline=v;
   const b=document.getElementById('sync-badge');
-  b.className=v?'online':'offline';
-  b.style.cssText='font-size:11px;padding:3px 9px;border-radius:20px;font-family:sans-serif;display:flex;align-items:center;gap:4px;font-weight:600';
+  // Use setAttribute to avoid className conflicts with other CSS rules
+  b.setAttribute('class','');
+  b.style.cssText=`font-size:11px;padding:3px 9px;border-radius:20px;font-family:sans-serif;display:flex;align-items:center;gap:4px;font-weight:600;${v?'background:rgba(26,122,74,.25);color:#7ee8a8':'background:rgba(180,120,10,.25);color:#f5c842'}`;
   document.getElementById('sync-label').textContent=v?'Synced':'Offline';
 }
 async function syncPending(){
@@ -740,45 +751,105 @@ function openPrintModal(inv){
     <div style="text-align:center;padding:14px 0">
       <div style="font-size:38px;margin-bottom:8px">🖨️</div>
       <div style="font-size:15px;font-weight:700;color:var(--navy);margin-bottom:3px">${escapeHtml(inv.invoiceNo)}</div>
-      <div style="font-size:13px;color:var(--text-secondary);font-family:sans-serif;margin-bottom:16px">${escapeHtml(inv.customerName)} &bull; Card #${escapeHtml(inv.cardNo||'—')} &bull; ₦${fmtNum(inv.total)}</div>
-      <button class="btn btn-primary" style="margin-bottom:10px" onclick="printInvoice('${inv.id}')">🖨 Print Invoice</button>
+      <div style="font-size:13px;color:var(--text-secondary);font-family:sans-serif;margin-bottom:6px">${escapeHtml(inv.customerName)} &bull; Card #${escapeHtml(inv.cardNo||'—')} &bull; ₦${fmtNum(inv.total)}</div>
+      <div style="font-size:12px;color:var(--text-muted);font-family:sans-serif;margin-bottom:18px">A receipt page will open in a new tab. Tap the Share or Print button there to send to your printer.</div>
+      <button class="btn btn-primary" style="margin-bottom:10px" onclick="printInvoice('${inv.id}')">🖨 Open Receipt to Print</button>
       <button class="btn btn-outline" onclick="closeModal()">Close</button>
     </div>`);
 }
+
+function buildReceiptHTML(inv){
+  const s=settings;
+  const esc=escapeHtml;
+  const rows=inv.items.map(item=>`
+    <tr>
+      <td style="padding:3px 0;border-bottom:1px dotted #ccc">${esc(item.name)}<br><small style="color:#555">${esc(item.service)}</small></td>
+      <td style="text-align:center;border-bottom:1px dotted #ccc">${item.qty}</td>
+      <td style="text-align:right;border-bottom:1px dotted #ccc">&#8358;${fmtNum(item.price)}</td>
+      <td style="text-align:right;border-bottom:1px dotted #ccc">&#8358;${fmtNum(item.price*item.qty)}</td>
+    </tr>`).join('');
+  return `<!DOCTYPE html><html><head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Receipt ${esc(inv.invoiceNo)}</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:monospace;font-size:12px;background:#fff;color:#000;padding:8px}
+    .wrap{width:100%;max-width:300px;margin:0 auto}
+    .center{text-align:center}
+    .biz{font-size:15px;font-weight:700;margin-bottom:2px}
+    .addr{font-size:10px;color:#333;margin-bottom:1px}
+    .dash{border-top:1px dashed #000;margin:6px 0}
+    .row{display:flex;justify-content:space-between;margin:2px 0;font-size:11px}
+    .row b{text-align:right}
+    table{width:100%;border-collapse:collapse;font-size:10px;margin:4px 0}
+    th{text-align:left;border-bottom:1px solid #000;padding:2px 0}
+    th:not(:first-child){text-align:right}
+    .total-line{display:flex;justify-content:space-between;font-size:13px;font-weight:700;margin-top:4px}
+    .balance-line{display:flex;justify-content:space-between;font-size:12px;font-weight:700;color:#c0392b}
+    .footer{text-align:center;font-size:10px;margin-top:10px;color:#555}
+    @media print{
+      body{padding:0}
+      .no-print{display:none}
+      @page{size:80mm auto;margin:2mm}
+    }
+  </style>
+</head><body>
+  <div class="wrap">
+    <div class="center biz">${esc(s.bizName||'DnH Laundromat')}</div>
+    <div class="center addr">${esc(s.bizAddress||'')}</div>
+    <div class="center addr">${esc(s.bizPhone1||'')}${s.bizPhone2?' / '+esc(s.bizPhone2):''}</div>
+    <div class="dash"></div>
+    <div class="row"><span>Invoice:</span><b>${esc(inv.invoiceNo)}</b></div>
+    <div class="row"><span>Date:</span><b>${fmtDate(inv.createdAt)}</b></div>
+    <div class="row"><span>Customer:</span><b>${esc(inv.customerName)}</b></div>
+    <div class="row"><span>Card No.:</span><b>#${esc(inv.cardNo||'—')}</b></div>
+    ${inv.customerPhone?`<div class="row"><span>Phone:</span><b>${esc(inv.customerPhone)}</b></div>`:''}
+    <div class="row"><span>Drop-off:</span><b>${fmtDate(inv.dropoffDate)}</b></div>
+    <div class="row"><span>Ready by:</span><b>${fmtDate(inv.readyDate)}</b></div>
+    ${inv.staffName?`<div class="row"><span>Staff:</span><b>${esc(inv.staffName)}</b></div>`:''}
+    <div class="dash"></div>
+    <table>
+      <tr><th>Item</th><th style="text-align:center">Qty</th><th style="text-align:right">Price</th><th style="text-align:right">Amount</th></tr>
+      ${rows}
+    </table>
+    <div class="dash"></div>
+    <div class="total-line"><span>TOTAL</span><span>&#8358;${fmtNum(inv.total)}</span></div>
+    <div class="row"><span>Amount Paid</span><b>&#8358;${fmtNum(inv.amountPaid)}</b></div>
+    ${inv.balance>0?`<div class="balance-line"><span>BALANCE DUE</span><span>&#8358;${fmtNum(inv.balance)}</span></div>`:''}
+    <div class="dash"></div>
+    ${inv.notes?`<div style="font-size:10px;margin-bottom:4px">Note: ${esc(inv.notes)}</div>`:''}
+    <div class="footer">Thank you for choosing ${esc(s.bizName||'DnH Laundromat')}!<br>Please keep this receipt.</div>
+    <div class="dash no-print"></div>
+    <div class="no-print" style="text-align:center;margin-top:12px">
+      <button onclick="window.print()" style="padding:10px 28px;font-size:15px;background:#0f2744;color:#fff;border:none;border-radius:8px;cursor:pointer;font-family:monospace;font-weight:700">🖨 Print</button>
+    </div>
+  </div>
+  <script>
+    // Auto-trigger print on desktop browsers; on mobile the user taps the button above
+    if(!/Android|iPhone|iPad/i.test(navigator.userAgent)){
+      window.onload=function(){ setTimeout(()=>window.print(),400); }
+    }
+  <\/script>
+</body></html>`;
+}
+
 function printInvoice(id){
   const inv=invoices.find(i=>i.id===id); if(!inv) return;
-  const s=settings;
-  document.getElementById('print-content').innerHTML=`
-    <div style="width:72mm;margin:0 auto;font-family:monospace;font-size:9pt;line-height:1.5;padding:2mm;color:#000">
-      <div style="text-align:center;font-size:12pt;font-weight:700">${escapeHtml(s.bizName||'DnH Laundromat')}</div>
-      <div style="text-align:center;font-size:7.5pt">${escapeHtml(s.bizAddress||'')}</div>
-      <div style="text-align:center;font-size:7.5pt">${escapeHtml(s.bizPhone1||'')}${s.bizPhone2?' / '+escapeHtml(s.bizPhone2):''}</div>
-      <div style="border-top:1px dashed #000;margin:4px 0"></div>
-      <div style="display:flex;justify-content:space-between"><span>Invoice:</span><span><b>${escapeHtml(inv.invoiceNo)}</b></span></div>
-      <div style="display:flex;justify-content:space-between"><span>Date:</span><span>${fmtDate(inv.createdAt)}</span></div>
-      <div style="display:flex;justify-content:space-between"><span>Customer:</span><span>${escapeHtml(inv.customerName)}</span></div>
-      <div style="display:flex;justify-content:space-between"><span>Card No.:</span><span><b>#${escapeHtml(inv.cardNo||'—')}</b></span></div>
-      ${inv.customerPhone?`<div style="display:flex;justify-content:space-between"><span>Phone:</span><span>${escapeHtml(inv.customerPhone)}</span></div>`:''}
-      <div style="display:flex;justify-content:space-between"><span>Drop-off:</span><span>${fmtDate(inv.dropoffDate)}</span></div>
-      <div style="display:flex;justify-content:space-between"><span>Ready by:</span><span>${fmtDate(inv.readyDate)}</span></div>
-      ${inv.staffName?`<div style="display:flex;justify-content:space-between"><span>Staff:</span><span>${escapeHtml(inv.staffName)}</span></div>`:''}
-      <div style="border-top:1px dashed #000;margin:4px 0"></div>
-      <table style="width:100%;border-collapse:collapse;font-size:8pt">
-        <tr style="border-bottom:1px solid #000"><td style="padding:2px 0;font-weight:700">Item</td><td style="text-align:center;font-weight:700;width:24px">Qty</td><td style="text-align:right;font-weight:700;width:54px">Price</td><td style="text-align:right;font-weight:700;width:62px">Amount</td></tr>
-        ${inv.items.map(item=>`<tr><td style="padding:2px 0">${escapeHtml(item.name)}<br><span style="font-size:7pt">${escapeHtml(item.service)}</span></td><td style="text-align:center">${item.qty}</td><td style="text-align:right">₦${fmtNum(item.price)}</td><td style="text-align:right">₦${fmtNum(item.price*item.qty)}</td></tr>`).join('')}
-      </table>
-      <div style="border-top:1px dashed #000;margin:4px 0"></div>
-      <div style="display:flex;justify-content:space-between;font-weight:700;font-size:10pt"><span>TOTAL</span><span>₦${fmtNum(inv.total)}</span></div>
-      <div style="display:flex;justify-content:space-between"><span>Amount Paid</span><span>₦${fmtNum(inv.amountPaid)}</span></div>
-      ${inv.balance>0?`<div style="display:flex;justify-content:space-between;font-weight:700"><span>BALANCE DUE</span><span>₦${fmtNum(inv.balance)}</span></div>`:''}
-      <div style="border-top:1px dashed #000;margin:5px 0"></div>
-      ${inv.notes?`<div style="font-size:7.5pt;margin-bottom:3px">Note: ${escapeHtml(inv.notes)}</div>`:''}
-      <div style="text-align:center;font-size:7.5pt;margin-top:5px">Thank you for choosing ${escapeHtml(s.bizName||'DnH Laundromat')}!</div>
-      <div style="margin-top:8px"></div>
-    </div>`;
-  document.getElementById('print-page').style.display='block';
   closeModal();
-  setTimeout(()=>{ window.print(); document.getElementById('print-page').style.display='none'; },150);
+  const html=buildReceiptHTML(inv);
+  // Open in new tab — works on all devices
+  const w=window.open('','_blank');
+  if(w){
+    w.document.write(html);
+    w.document.close();
+  } else {
+    // Fallback if popup blocked: use blob URL
+    const blob=new Blob([html],{type:'text/html'});
+    const url=URL.createObjectURL(blob);
+    window.open(url,'_blank');
+    setTimeout(()=>URL.revokeObjectURL(url),60000);
+  }
 }
 
 // ══ DASHBOARD ══
